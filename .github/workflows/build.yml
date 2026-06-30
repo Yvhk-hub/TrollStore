@@ -1,0 +1,180 @@
+name: Build TrollStore Compatible Fast
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    steps:
+    - name: Checkout source code
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Force set compatible Xcode version
+      run: |
+        sudo xcode-select -s /Applications/Xcode_15.0.app/Contents/Developer
+        xcodebuild -version
+
+    - name: Install Signing Tools
+      run: |
+        echo "=== Installing ldid ==="
+        brew install ldid
+
+    - name: Setup Theos Environment
+      run: |
+        echo "=== Installing Theos ==="
+        export THEOS=/Users/runner/theos
+        git clone --recursive https://github.com/theos/theos.git $THEOS
+        
+        echo "=== Installing Missing iOS SDK ==="
+        rm -rf $THEOS/sdks
+        git clone https://github.com/theos/sdks.git $THEOS/sdks
+        
+        echo "THEOS=$THEOS" >> $GITHUB_ENV
+
+    - name: Build Custom iOS Libarchive
+      run: |
+        export THEOS=/Users/runner/theos
+        echo "=== Downloading libarchive source ==="
+        git clone https://github.com/libarchive/libarchive.git
+        cd libarchive
+        
+        echo "=== Compiling libarchive for iOS (arm64 & arm64e) ==="
+        mkdir build_ios && cd build_ios
+        
+        cmake .. \
+          -DCMAKE_SYSTEM_NAME=iOS \
+          -DCMAKE_OSX_ARCHITECTURES="arm64;arm64e" \
+          -DCMAKE_OSX_SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path) \
+          -DENABLE_TAR=OFF \
+          -DENABLE_CPIO=OFF \
+          -DENABLE_CAT=OFF \
+          -DENABLE_XATTR=OFF \
+          -DENABLE_ACL=OFF \
+          -DENABLE_TEST=OFF \
+          -DENABLE_INSTALL=OFF
+        
+        make -j$(sysctl -n hw.ncpu) archive_static
+        
+        mkdir -p $THEOS/vendor/lib
+        mkdir -p $THEOS/vendor/include
+        cp libarchive/libarchive.a $THEOS/vendor/lib/
+        cp ../libarchive/*.h $THEOS/vendor/include/
+
+    - name: Run build and pack
+      run: |
+        export THEOS=/Users/runner/theos
+        export CFLAGS="-Wno-implicit-function-declaration -Wno-error=implicit-function-declaration -I$THEOS/vendor/include"
+        export LDFLAGS="-L$THEOS/vendor/lib -lz -lbz2 -liconv"
+        export MAKEFLAGS="-j$(sysctl -n hw.ncpu)"
+        
+        echo "=== 1. 执行原生编译 ==="
+        THEOS_NO_CLEAN=1 make messages=yes || true
+        
+        echo "=== 2. 创建标准的 Payload 结构 ==="
+        rm -rf Payload
+        mkdir -p Payload/TrollStore.app
+        
+        echo "=== 3. 提取编译产物 ==="
+        # A. 提取主 App 的基础资源和主二进制
+        if [ -d "./TrollStore/.theos/obj/TrollStore.app" ]; then
+          echo "复制主 TrollStore.app 基础目录..."
+          cp -r ./TrollStore/.theos/obj/TrollStore.app/* Payload/TrollStore.app/ 2>/dev/null || true
+        elif [ -d "./TrollStore/.theos/obj/arm64/TrollStore.app" ]; then
+          echo "复制主 TrollStore.app (arm64) 基础目录..."
+          cp -r ./TrollStore/.theos/obj/arm64/TrollStore.app/* Payload/TrollStore.app/ 2>/dev/null || true
+        else
+          # Fallback 复制资源
+          if [ -d "./TrollStore/Resources" ]; then
+            cp -r ./TrollStore/Resources/* Payload/TrollStore.app/ 2>/dev/null || true
+          fi
+          # 全局寻找主二进制
+          find . -type f -name "TrollStore" -not -path "*/Payload/*" -exec cp {} Payload/TrollStore.app/TrollStore \; 2>/dev/null || true
+        fi
+        
+        # B. 提取提权助手二进制 (PersistenceHelper)
+        # 官方 Makefile 编译后会把 PersistenceHelper 备份到 ./_build/PersistenceHelper_Embedded 并随即执行 clean 抹除临时目录
+        if [ -f "./_build/PersistenceHelper_Embedded" ]; then
+          echo "发现完美备份的 PersistenceHelper_Embedded，正在安全提取..."
+          cp ./_build/PersistenceHelper_Embedded Payload/TrollStore.app/PersistenceHelper
+        else
+          echo "未发现备份文件，尝试在全局搜寻 TrollStorePersistenceHelper 作为 fallback..."
+          find . -type f -name "TrollStorePersistenceHelper" -not -path "*/Payload/*" -exec cp {} Payload/TrollStore.app/PersistenceHelper \; 2>/dev/null || true
+        fi
+        
+        # C. 提取 RootHelper 提权二进制 (trollstorehelper)
+        if [ -f "./RootHelper/.theos/obj/trollstorehelper" ]; then
+          echo "从 RootHelper 编译路径提取 trollstorehelper..."
+          cp ./RootHelper/.theos/obj/trollstorehelper Payload/TrollStore.app/trollstorehelper
+        elif [ -f "./RootHelper/.theos/obj/arm64/trollstorehelper" ]; then
+          echo "从 RootHelper (arm64) 编译路径提取 trollstorehelper..."
+          cp ./RootHelper/.theos/obj/arm64/trollstorehelper Payload/TrollStore.app/trollstorehelper
+        else
+          echo "未在默认位置找到，尝试全局搜寻 trollstorehelper..."
+          find . -type f -name "trollstorehelper" -not -path "*/Payload/*" -exec cp {} Payload/TrollStore.app/trollstorehelper \; 2>/dev/null || true
+        fi
+
+        # 确保所有提取出来的文件均具有执行权限
+        chmod +x Payload/TrollStore.app/TrollStore 2>/dev/null || true
+        chmod +x Payload/TrollStore.app/PersistenceHelper 2>/dev/null || true
+        chmod +x Payload/TrollStore.app/trollstorehelper 2>/dev/null || true
+
+        echo "=== 4. 检查当前提取到的核心目录结构 ==="
+        ls -la Payload/TrollStore.app/
+
+        # 如果刚才提取出了带官方 CoreTrust Bypass 的黄金备份，则坚决不要手动执行 ldid 重签
+        if [ -f "Payload/TrollStore.app/PersistenceHelper" ] && [ -f "Payload/TrollStore.app/trollstorehelper" ]; then
+          echo "=== 5. 已完美接入带官方 CoreTrust Bypass 签名文件，自动跳过 ldid 手动重签 ==="
+        else
+          echo "=== 5. 部分核心文件缺失，执行 fallback 手动重签 ==="
+          ENT_APP=""
+          ENT_HELPER=""
+          
+          if [ -f "./TrollStore/entitlements.plist" ]; then
+            ENT_APP="./TrollStore/entitlements.plist"
+          fi
+          
+          if [ -f "./TrollHelper/entitlements.plist" ]; then
+            ENT_HELPER="./TrollHelper/entitlements.plist"
+          elif [ -f "./RootHelper/entitlements.plist" ]; then
+            ENT_HELPER="./RootHelper/entitlements.plist"
+          fi
+          
+          if [ -f "Payload/TrollStore.app/TrollStore" ]; then
+            if [ -n "$ENT_APP" ]; then
+              ldid -S"$ENT_APP" Payload/TrollStore.app/TrollStore
+            else
+              ldid -S Payload/TrollStore.app/TrollStore
+            fi
+          fi
+          
+          if [ -f "Payload/TrollStore.app/PersistenceHelper" ]; then
+            if [ -n "$ENT_HELPER" ]; then
+              ldid -S"$ENT_HELPER" Payload/TrollStore.app/PersistenceHelper
+            else
+              ldid -S Payload/TrollStore.app/PersistenceHelper
+            fi
+          fi
+          
+          if [ -f "Payload/TrollStore.app/trollstorehelper" ]; then
+            ldid -S Payload/TrollStore.app/trollstorehelper
+          fi
+        fi
+
+        echo "=== 6. 手工压制巨魔专用安装包 ==="
+        zip -r TrollStore-Pure-Manual.tipa Payload/
+        echo "=== 提取与打包封装全部完成！ ==="
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: TrollStore-Pure-Manual
+        path: |
+          *.tipa
